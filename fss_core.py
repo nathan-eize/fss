@@ -7,11 +7,13 @@
 #--------------------------------------------
 # FSS definitions
 #--------------------------------------------
-
+# Added content
 # Code from Faggian N, Roux B, Steinle P, Ebert B. 2015. Fast calculation of the fractions skill score. Mausam 66: 457466.
 
 import collections
 import scipy.signal as signal
+import numpy as np
+import pandas as pd
 
 # Define an integral image data-type.
 IntegralImage = collections.namedtuple(
@@ -65,13 +67,13 @@ def integralField(field, n, integral=None):
 
         assert integral.padding >= window, 'Expected larger table.'
 
-        #integral = IntegralImage(
-        #    table=integral.table[
-        #       (integral.padding - window):-(integral.padding - window),
-        #       (integral.padding - window):-(integral.padding - window)
-        #       ]    ,
-        #    padd    ing=window
-        #    )
+        integral = IntegralImage(
+            table=integral.table[
+               (integral.padding - window):-(integral.padding - window),
+               (integral.padding - window):-(integral.padding - window)
+               ],
+            padding=window
+            )
 
     else:
         integral = summedAreaTable(field, padding=window)
@@ -110,9 +112,11 @@ def fss(fcst, obs, threshold, window, fcst_cache=None, obs_cache=None):
     @return: float, numerator, denominator and FSS
     FSS = 1 - numerator/denominator
     """
-    
-    fhat = integralField(fcst>threshold, window, integral=fcst_cache)
-    ohat = integralField(obs>threshold, window, integral=obs_cache)
+
+    #fhat = integralField(fcst>threshold, window, integral=fcst_cache)
+    #ohat = integralField(obs>threshold, window, integral=obs_cache)
+    fhat = integralField(fcst>threshold, window)
+    ohat = integralField(obs>threshold, window)
 
     scale = 1.0 / fhat.size
     num = np.nanmean(np.power(fhat - ohat, 2))
@@ -124,7 +128,7 @@ def fss(fcst, obs, threshold, window, fcst_cache=None, obs_cache=None):
 
 def fss_frame(fcst, obs, windows, levels):
     """
-    Faggian N, Roux B, Steinle P, Ebert B. 2015. Fast calculation of the fractions skill score. Mausam 66: 457466.	    
+    Faggian N, Roux B, Steinle P, Ebert B. 2015. Fast calculation of the fractions skill score. Mausam 66: 457466.
     Compute the fraction skill score data-fram.
     :param fcst: nd-array, forecast field.
     :param ods: nd-array, observation field.
@@ -135,18 +139,17 @@ def fss_frame(fcst, obs, windows, levels):
     num_data, den_data, fss_data = [], [], []
 
     for level in levels:
-        ftable = summedAreaTable(fcst > level)
-	otable = summedAreaTable(obs>level)
+        ftable = summedAreaTable(fcst>level)
+        otable = summedAreaTable(obs>level)
         #ftable = compute_integral_table(fcst > level)
 	#otable = compute_integral_table(obs>level)
 
-        _data = [fss(fcst, obs, level, w, ftable, otable) for w in windows]
+        _data = [fss(fcst, obs, level, w, fcst_cache=ftable, obs_cache=otable) for w in windows]
 
 	num_data.append([x[0] for x in _data])
 	den_data.append([x[1] for x in _data])
 	fss_data.append([x[2] for x in _data])
- 
+
     return (pd.DataFrame(num_data, index=levels, columns=windows),
            pd.DataFrame(den_data, index=levels, columns=windows),
            pd.DataFrame(fss_data, index=levels, columns=windows))
-
