@@ -4,7 +4,7 @@
 
   Nathan Eizenberg, April 2018 adapted from Peter Steinle's original fss3.py code
 """
-
+# TEST LOCAL CHANGE, ANOTHER CHNAGE
 import os, sys
 import argparse
 from datetime import datetime as dt
@@ -39,13 +39,13 @@ parser = argparse.ArgumentParser()
 parser.add_argument("-m",
             "--model",
             nargs="?",
-	    type=str,
+	        type=str,
             help="Model data to use, eg. BARRA_R, BARRA_SY, etc...")
-#parser.add_argument("-d",
-#            "--date",
-#            nargs="?",
-#	    type=str,
-#            help="Start date to perform 24 hour FFS, ISO8601 format eg. 20140714T1800Z")
+parser.add_argument("-d",
+            "--date",
+            nargs="?",
+	        type=str,
+            help="Date to try calc FFS, ISO8601 format eg. 20140714T1800Z. Note that TRMM data is 3 hourly accumulation centred on 00,03,..24 and AWAP is daily")
 parser.add_argument("-o",
             "--obstype",
             nargs="?",
@@ -58,7 +58,7 @@ parser.add_argument("-i",
             help="Model input file on the same grid as the obs")
 
 #--------------------------------------------
-# Misc definitions 
+# Misc definitions
 #--------------------------------------------
 
 def stdout(s):
@@ -69,12 +69,14 @@ _iso_format = '%Y%m%dT%H%MZ' # ISO 8601 format
 trmm_hours_total = int(3)
 trmmBaseHours = range(0,24,3)
 barra2trmm_dt_map = lambda dt: dt - delt(hours=1,minutes=30)
+# the barra equivalent times are +- 1.5 hours from trmm basetime
+trmm2barra_dt_map = lambda dt: [dt - delt(hours=1,minutes=30), dt + delt(hours=1,minutes=30)]
 
-def merge_data( fid ):
-    """ There is a problem with the interpolation where the time dimension is split into three iseperate dimensions 'time', 'time0' and 'time1'. This merges the three and produces a data xarra that is in order
+def merge_trmm_data( fid ):
+    """ There is a problem with the interpolation of trmm data where the time dimension is split into three iseperate dimensions 'time', 'time0' and 'time1'. This merges the three and produces a data xarra that is in order
     """
     # Load xarray, not that forecast_period only has one repeat
-    mdat = xr.DataArray( 
+    mdat = xr.DataArray(
 	        np.concatenate( [ fid.variables[var][:] for var in ['accum_prcp', 'accum_prcp_0', 'accum_prcp_1'] ]), \
 	        coords = {
 	    'time': np.concatenate([num2date(fid.variables[tvar][:], fid.variables['time'].units) for tvar in ['time','time_0', 'time_1'] ]),\
@@ -97,6 +99,33 @@ stdout('ARGS:')
 stdout(args)
 stdout('')
 
+assert args.date, "Requires date input string"
+date_in = dt.strptime(args.date, _iso_format)
+if args.obstype == "trmm":
+    assert date_in.hour in trmmBaseHours, "Input hour must be in trmm base hours {:}".format(trmmBaseHours)
+else:
+    print("Not yet configured AWAP time")
+    sys.exit(1)
+
+# get obs data
+obsData = {}
+if args.obstype == 'trmm':
+    stdout('Using TRMM observational data')
+    stdout('')
+    obs_dat, obs_err, obs_head_dict = trmm._get_single_grid(date_in, get_header_info=True)
+    obs_dat, _, obs_lat, obs_lon = trmm._to_grid(obs_dat, obs_err)
+    stdout('')
+else:
+    stdout('Error, obs type {} not yet written yet'.format(args.obstype))
+    sys.exit(0)
+
+obsData.update({
+		'type':args.obstype,\
+	    'prcp':obs_dat,\
+		'lat':obs_lat,\
+		'lon':obs_lon
+		})
+
 # get model data
 modData = {}
 if not args.model.startswith('BARRA'):
@@ -106,83 +135,64 @@ else:
     stdout('Using {} for model data'.format(args.model))
     assert os.path.exists(args.infile), "Cannot find file {}".format(args.infile)
     mod_fid = Dataset(args.infile, 'r')
-    if all([ v in mod_fid.variables.keys() for v in ['time','time_0', 'time_1']]):
-	mod_dat = merge_data(mod_fid)
-    else:
-	print('Not yet written')
+    if args.obstype == 'trmm':
+        if all([ v in mod_fid.variables.keys() for v in ['time','time_0', 'time_1']]):
+	        mod_dat = merge_trmm_data(mod_fid)
+        else:
+            # load the data normally
+            mod_dat = xr.DataArray(
+                mod_fid.variables["accum_prcp"][:], \
+                coords = {
+                'time': num2date(mod_fid.variables['time'][:], mod_fid.variables['time'].units) ,\
+                #'forecast_period': fid.variables['forecast_period'][:],
+                'latitude': mod_fid.variables['trmm_lat'][:],\
+                'longitude': mod_fid.variables['trmm_lon'][:]},\
+                    dims = ['time', 'latitude','longitude']
+                    )
+        # now restrict the model data
+        assert 'time' in mod_dat.coords.keys(), "Model data is not read in properly, requires time dim"
+        assert all( ds in mod_dat.time.data for ds in trmm2barra_dt_map(date_in) ), "Model data array is missing one of the required datetimes {:}".format(trmm2barra_dt_map(date_in))
+        tidx = np.concatenate([ np.where(mod_dat.time.data == ds)[0] for ds in trmm2barra_dt_map(date_in) ])
+        if len(tidx) == 3:
+            # take the first two, third is from a later forecast_period
+            #TODO Check this ^^
+            tidx = tidx[:2]
+        # Subtract the two values to get the 3 hour accumulation
+        assert (mod_dat[tidx[1]].time.data - mod_dat[tidx[0]].time.data).item() / 10 ** 9 / 3600. == 3.
+        mod_dat = mod_dat[tidx[1]] - mod_dat[tidx[0]]
     mod_fid.close()
 
 modData.update({
 		'type':args.model,\
-	       	'prcp':mod_dat.data,\
+	    'prcp':mod_dat.data,\
 		'lat':mod_dat.latitude.data,\
 		'lon':mod_dat.longitude.data
 		})
 
-assert 'time' in mod_dat.coords.keys(), "Model data is not read in properly, requires time dim"
-
-# get obs data
-obsData = {}
-if args.obstype == 'trmm':
-    stdout('Using TRMM observational data')
-    # get the hour that is closest to the trmm base hours
-    #trmmHr = np.argmin(np.abs(dStart.hour - np.array(trmmBaseHours)))
-    #stdout("Changing the start hour to {:d} to align with trmm obs".format(trmmHr))
-    #stdout('New time start: {}'.format(dStart.strftime(_iso_format))) 
-    #stdout('New time end: {}'.format(dEnd.strftime(_iso_format)))
-    stdout('')
-    # grab the right trmm data grids using the trmm_core modules
-    #obs_dat, _,= trmm._get_single_grid(mod_dat.time.data[0])
-    obs_dat, obs_err, obs_head_dict = trmm._get_single_grid(barra2trmm_dt_map(mod_dat.time.data[0]), get_header_info=True)
-    obs_dat, _, obs_lat, obs_lon = trmm._to_grid(obs_dat, obs_err)
-    stdout('')
-else:
-    stdout('Error, obs type {} not yet written yet'.format(args.obstype))
-    sys.exit(0)
-
-obsData.update({
-		'type':args.obstype,\
-	       	#'prcp':np.rollaxis(obs_dat,2,start=0),\
-	       	'prcp':obs_dat,\
-		'lat':obs_lat,\
-		'lon':obs_lon
-		})
-
 
 # Now limit the lat lon obs grids to fit the model data
-obsLonMask = np.logical_and(obsData['lon']<=modData['lon'].max(), obsData['lon']>=modData['lon'].min()) 
+obsLonMask = np.logical_and(obsData['lon']<=modData['lon'].max(), obsData['lon']>=modData['lon'].min())
 obsLonMaskDim = obsLonMask.sum()
-obsLatMask = np.logical_and(obsData['lat']<=modData['lat'].max(), obsData['lat']>=modData['lat'].min()) 
+obsLatMask = np.logical_and(obsData['lat']<=modData['lat'].max(), obsData['lat']>=modData['lat'].min())
 obsLatMaskDim = obsLatMask.sum()
 obsLonLonMask, obsLatLatMask = np.meshgrid(obsLonMask, obsLatMask)
 obsPrcpMask = np.logical_and(obsLonLonMask, obsLatLatMask)
 gridSize = obsPrcpMask.sum()
 obsData.update({'lat':obsData['lat'][obsLatMask],\
-	       	'lon':obsData['lon'][obsLonMask],\
-		'prcp':obsData['prcp'][obsPrcpMask].reshape((obsLatMaskDim,obsLonMaskDim))
+	       	    'lon':obsData['lon'][obsLonMask],\
+		        'prcp':obsData['prcp'][obsPrcpMask].reshape((obsLatMaskDim,obsLonMaskDim))
 		})
 
-## Interpolate function to the obs grid
-#obsLatLat, obsLonLon = np.meshgrid(obsData['lat'], obsData['lon'])
-#obsCoords = np.rollaxis(np.vstack((obsLonLon.reshape(-1), obsLatLat.reshape(-1))),1,0)
-##interpNN = interpolate.NearestNDInterpolator(obsCoords,obsData['prcp'].reshape(-1))
-#modLatLat, modLonLon = np.meshgrid(modData['lat'], modData['lon'])
-#modCoords = np.rollaxis(np.vstack((modLonLon.reshape(-1), modLatLat.reshape(-1))),1,0)
-#interpNNMod = interpolate.NearestNDInterpolator(modCoords,modData['prcp'].reshape(-1))
-## interpolate
-#modData['prcp'] = interpNNMod( obsCoords ).reshape((obsLatMaskDim,obsLonMaskDim))
-
-
 # test the fractional skill score calcs
-thresh = float(0.4)
+thresh = [0.2, 0.4, 5., 10., 30.]
 maxDist = min(obsData['lat'].max() - obsData['lat'].min(), obsData['lon'].max() - obsData['lon'].min())
 grid_space = ((obsData['lat'][1]-obsData['lat'][0]) + (obsData['lon'][1]-obsData['lon'][0]))/2
 max_scan = maxDist / grid_space
 
-nres = [ int(10**x) for x in np.arange(np.log10(max_scan/6.0), np.log10(max_scan), np.log10(1.4))]
+nres = [ int(10**x) for x in np.arange(np.log10(max_scan/6.0), np.log10(max_scan), np.log10(1.3))]
 nres.insert(0,5)
 resArr = np.array( [ i if i%2 != 0 else i + 1 for i in nres], dtype=int)
 
-numDf, denomDf, fssDf = fss.fss_frame(modData['prcp'][0], obsData['prcp'], nres, [thresh])
+numDf, denomDf, fssDf = fss.fss_frame(modData['prcp'], obsData['prcp'], nres, thresh)
 
 stdout('Done')
